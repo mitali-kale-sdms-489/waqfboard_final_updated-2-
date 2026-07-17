@@ -1,0 +1,21 @@
+# Backend (Python)
+waqf-backend/.venv/
+waqf-backend/__pycache__/
+**/__pycache__/
+waqf-backend/.env
+waqf-backend/*.db
+waqf-backend/storage/*
+!waqf-backend/storage/.gitkeep
+*.pyc
+
+# Frontend (Node)
+waqf-frontend/node_modules/
+waqf-frontend/dist/
+waqf-frontend/tsconfig.tsbuildinfo
+waqf-frontend/.env
+
+# OS / editor
+.DS_Store
+*.log
+.vscode/
+.idea/
