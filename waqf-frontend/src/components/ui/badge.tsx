@@ -12,6 +12,10 @@ const badgeVariants = cva(
         outline: "border-border text-foreground",
         // Confidence bands (architecture doc §8: green ≥0.9, amber 0.6–0.9, red <0.6)
         success: "border-transparent bg-registry-green/15 text-registry-green",
+        // Distinct clear-green used only for "Accepted" documents, kept
+        // separate from `success` (which also backs the high-confidence
+        // band badge) so the two can be styled independently.
+        accepted: "border-transparent bg-green-100 text-green-700",
         warning: "border-transparent bg-brass/15 text-brass",
         danger: "border-transparent bg-rust/15 text-rust",
         // Role badges (Header) — named by permission level, not role label

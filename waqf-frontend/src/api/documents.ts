@@ -70,25 +70,73 @@ export async function getDashboardStats(): Promise<DashboardStats> {
 export interface UploadResult {
   document: WaqfDocument;
   fields: ExtractedField[];
-  diagnostics: { primaryEngine: string; notes: string[] };
+  diagnostics: { primaryEngine: string; notes: string[] } | null;
 }
 
-/** POST /documents/upload — multipart file upload; runs OCR synchronously
- *  server-side and returns the extracted record. This can involve several
- *  sequential network calls server-side (Sarvam Vision job polling, and —
- *  when confidence is low — Tesseract/Gemini comparison plus a second
- *  Gemini call for field backfill), so it gets a much longer timeout than
- *  the rest of the API: the default 30s was routinely expiring client-side
- *  while the backend kept working and completed the upload anyway (visible
- *  only after a manual refresh, with the UI incorrectly reporting failure). */
+/** POST /documents/upload — multipart file upload. The backend now only
+ *  saves the file and creates the document row (status="processing")
+ *  before responding; the actual OCR pipeline (Sarvam Vision job polling,
+ *  Tesseract/Gemini comparison, Qwen-via-Ollama field mapping, Gemini
+ *  backfill/translation) runs afterward as a background task, since that
+ *  chain routinely took well over two minutes and no client-side timeout
+ *  could reliably outlast it. This request should come back in well under
+ *  a second; the 20s timeout here is just a safety margin, not a budget
+ *  for OCR. Poll the returned document's id with pollDocumentUntilReady
+ *  to find out when OCR actually finishes. */
 export async function uploadDocument(file: File): Promise<UploadResult> {
   const formData = new FormData();
   formData.append("file", file);
   const { data } = await apiClient.post<UploadResult>("/documents/upload", formData, {
     headers: { "Content-Type": "multipart/form-data" },
-    timeout: 120_000,
+    timeout: 20_000,
   });
   return data;
+}
+
+/** POST /documents/{id}/reupload — multipart file upload that replaces the
+ *  file behind a flagged document and re-runs OCR against it, reusing the
+ *  same document id (unlike uploadDocument, which always creates a new
+ *  document). The backend caps this at MAX_REUPLOAD_ATTEMPTS and returns a
+ *  409 once exhausted; the updated document's reuploadCount tells the
+ *  Dashboard's flag dialog how many attempts remain. Same "processing"/poll
+ *  shape as uploadDocument — the OCR pipeline runs as a background task. */
+export async function reuploadDocument(documentId: string, file: File): Promise<UploadResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const { data } = await apiClient.post<UploadResult>(`/documents/${documentId}/reupload`, formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+    timeout: 20_000,
+  });
+  return data;
+}
+
+export interface PollOptions {
+  intervalMs?: number;
+  /** Give up after this long and resolve with whatever state we last saw
+   *  (still "processing" is possible — the document is safe either way,
+   *  just still being worked on server-side; the caller can choose to poll
+   *  again later rather than treat this as failure). */
+  timeoutMs?: number;
+}
+
+/** Polls GET /documents/{id} until the background OCR task moves the
+ *  document out of status="processing" (into extracted/validated/flagged),
+ *  or until timeoutMs elapses. Replaces the old filename+uploader+recency
+ *  matching hack — polling by id is exact, so there's no ambiguity and,
+ *  since the document row already exists the moment upload() returns,
+ *  there's nothing for the caller to "retry" and no way to create a
+ *  duplicate by polling. */
+export async function pollDocumentUntilReady(
+  documentId: string,
+  { intervalMs = 2000, timeoutMs = 5 * 60 * 1000 }: PollOptions = {}
+): Promise<DocumentDetail | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const detail = await getDocument(documentId);
+    if (detail && detail.document.status !== "processing") return detail;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return null;
 }
 
 export interface SubmitReviewOptions {
@@ -128,4 +176,27 @@ export async function getFlagReason(
   const latest = flagReviews[flagReviews.length - 1];
   if (!latest) return null;
   return { reason: latest.notes, reviewerId: latest.reviewerId, reviewedAt: latest.reviewedAt };
+}
+
+export interface SupportedLanguage {
+  code: string;
+  label: string;
+}
+
+/** GET /documents/translate/languages — languages the flag-reason
+ *  translator can translate into, for the Dashboard's language picker. */
+export async function getTranslateLanguages(): Promise<SupportedLanguage[]> {
+  const { data } = await apiClient.get<SupportedLanguage[]>("/documents/translate/languages");
+  return data;
+}
+
+/** POST /documents/translate — translates free text (a supervisor's flag
+ *  reason) into `targetLanguage` (e.g. "en-IN", "ur-IN"). Source language
+ *  is auto-detected on the backend. */
+export async function translateText(text: string, targetLanguage: string): Promise<string> {
+  const { data } = await apiClient.post<{ translatedText: string; targetLanguage: string }>(
+    "/documents/translate",
+    { text, targetLanguage }
+  );
+  return data.translatedText;
 }

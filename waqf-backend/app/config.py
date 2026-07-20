@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "insecure-dev-secret-change-me"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 480
+    # USER accounts upload documents over the course of a work week and
+    # shouldn't have to re-login mid-batch — 7 days. SUPERVISOR tokens keep
+    # the shorter `access_token_expire_minutes` default above since they
+    # can approve/flag/correct records, a more sensitive action set.
+    user_access_token_expire_minutes: int = 7 * 24 * 60
 
     # OCR engines
     sarvam_api_key: str | None = None
@@ -46,7 +51,7 @@ class Settings(BaseSettings):
     # Qwen2.5 field-extraction mapper, served locally via Ollama. Replaces
     # the shasan_stub regex mapper as the pipeline's mapping stage.
     ollama_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.2:latest"
+    ollama_model: str = "qwen2.5:7b"
     # 120s default rather than a shorter "should be plenty" number: a 7B
     # model on CPU-only hardware, or a cold call before Ollama has the
     # model loaded into memory, can easily take well over a minute.

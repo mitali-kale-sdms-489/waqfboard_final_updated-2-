@@ -11,7 +11,6 @@ import {
   Loader2,
   Pencil,
   RefreshCw,
-  ShieldCheck,
   XCircle,
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
@@ -265,15 +264,6 @@ export function Review() {
         </Badge>
         {current.isSynthetic && <Badge variant="warning">Seeded test document</Badge>}
         {current.previewUrl && <Badge variant="outline">Uploaded from device</Badge>}
-        {current.dpdpStatus === "compliant" ? (
-          <Badge variant="outline" className="gap-1" title={current.dpdpReason ?? undefined}>
-            <ShieldCheck className="h-3 w-3 text-registry-green" /> DPDP compliant
-          </Badge>
-        ) : (
-          <Badge variant="danger" className="gap-1" title={current.dpdpReason ?? undefined}>
-            <AlertTriangle className="h-3 w-3" /> DPDP: needs review
-          </Badge>
-        )}
         <Badge variant={CONFIDENCE_BADGE[band]}>
           {current.overallConfidence !== null
             ? `${Math.round(current.overallConfidence * 100)}% confidence`
@@ -302,8 +292,10 @@ export function Review() {
         </details>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <DocumentPreview doc={current} />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+        <div className="lg:sticky lg:top-4 lg:self-start lg:h-[calc(100vh-2rem)]">
+          <DocumentPreview doc={current} minHeightClassName="h-full min-h-[480px]" className="h-full" />
+        </div>
 
         <div className="space-y-4">
           <div className="rounded-lg border border-border bg-card p-5 space-y-4">
@@ -422,13 +414,12 @@ export function Review() {
           <DialogHeader>
             <DialogTitle>Flag for supervisor review</DialogTitle>
             <DialogDescription>
-              Explain why {current.filename} needs a second look. This routes it to the
-              supervisor queue instead of closing it out.
+              Explain what's wrong with this document. It will be flagged after review.
             </DialogDescription>
           </DialogHeader>
           <Textarea
             autoFocus
-            placeholder="e.g. Survey number illegible in scan, mutawalli name conflicts with register…"
+            placeholder="e.g. Survey number is hard to read, name doesn't match the register…"
             value={flagReason}
             onChange={(e) => setFlagReason(e.target.value)}
             rows={4}

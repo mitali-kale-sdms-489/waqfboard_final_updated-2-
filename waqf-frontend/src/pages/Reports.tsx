@@ -21,8 +21,8 @@ const STATUS_LABEL: Record<DocumentStatus, string> = {
   processing: "Processing",
   extracted: "Awaiting review",
   validated: "Awaiting review",
-  reviewed: "Reviewed",
-  approved: "Approved",
+  reviewed: "Accepted",
+  approved: "Accepted",
   flagged: "Flagged",
 };
 

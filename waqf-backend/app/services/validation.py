@@ -115,29 +115,13 @@ def _parse_date(raw: str) -> date | None:
     return None
 
 
-def _normalize_raw_date(raw: str) -> str | None:
-    if not raw:
-        return None
-    raw = raw.strip()
-
-    # Extract the first supported date-like token and ignore trailing OCR noise.
-    # This allows values like "04-07-2011 | ୦லகஜ஍ஞகசகஏச" to still validate.
-    match = re.search(r"(\d{2}[-/]\d{2}[-/]\d{4}|\d{4}-\d{2}-\d{2})", raw)
-    if match:
-        return match.group(0)
-    return None
-
-
 def _check_date_plausibility(
     db: Session, document: WaqfDocument, fields: FieldMap
 ) -> tuple[ValidationRuleResult, str]:
     raw = _value(fields, FieldName.registration_date)
     if not raw:
         return ValidationRuleResult.fail, "Registration date is missing."
-    normalized = _normalize_raw_date(raw)
-    if normalized is None:
-        return ValidationRuleResult.fail, f"'{raw}' is not a recognised date (expected YYYY-MM-DD)."
-    parsed = _parse_date(normalized)
+    parsed = _parse_date(raw)
     if parsed is None:
         return ValidationRuleResult.fail, f"'{raw}' is not a recognised date (expected YYYY-MM-DD)."
     today = date.today()
@@ -175,7 +159,7 @@ def _check_cross_document_consistency(
         .all()
     )
     if duplicates:
-        filenames = ", ".join(dict.fromkeys(d.filename for d in duplicates))
+        filenames = ", ".join(d.filename for d in duplicates)
         return (
             ValidationRuleResult.fail,
             f"Property ID {property_id} also appears in {filenames} — possible duplicate filing.",

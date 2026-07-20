@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import threading
 import time
 
@@ -42,12 +43,7 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-REQUEST_TIMEOUT = httpx.Timeout(
-    connect=10.0,
-    read=90.0,
-    write=90.0,
-    pool=90.0,
-)
+REQUEST_TIMEOUT = 25.0
 
 # Serializes + throttles every Gemini call this process makes, so a
 # document that needs OCR fallback, gap-fill, AND translation (up to 3
@@ -67,23 +63,17 @@ def _throttle() -> None:
         _last_call_at = time.monotonic()
 
 
-def _post_generate_content(body: dict, *, log_warnings: bool = True) -> tuple[dict | None, int | None]:
+def _post_generate_content(body: dict) -> dict | None:
     """POSTs `body` to the configured Gemini model's generateContent
     endpoint, shared by every call site below (OCR, field extraction,
     translation) so throttling and retry behavior only need to live in one
-    place.
-
-    Retries on HTTP 429 up to `gemini_max_retries` times, honoring the
-    response's Retry-After header when present and falling back to
+    place. Retries on HTTP 429 up to `gemini_max_retries` times, honoring
+    the response's Retry-After header when present and falling back to
     exponential backoff otherwise. Any other failure (timeout, other
     4xx/5xx, connection error) is NOT retried — logged and treated as
-    "Gemini unavailable for this call", same as before. Never raises.
-
-    Returns a tuple of the parsed response and the final HTTP status
-    code when the call failed with an HTTP response.
-    """
+    "Gemini unavailable for this call", same as before. Never raises."""
     if not settings.gemini_configured:
-        return None, None
+        return None
 
     url = f"{GEMINI_API_BASE}/{settings.gemini_model}:generateContent"
     attempt = 0
@@ -93,23 +83,9 @@ def _post_generate_content(body: dict, *, log_warnings: bool = True) -> tuple[di
             with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
                 resp = client.post(url, params={"key": settings.gemini_api_key}, json=body)
                 resp.raise_for_status()
-                text = resp.text
-                try:
-                    return resp.json(), None
-                except json.JSONDecodeError as exc:
-                    if log_warnings:
-                        logger.warning(
-                            "Gemini (%s) returned HTTP %s but response body was not valid JSON: %s\nResponse body=%r",
-                            settings.gemini_model,
-                            resp.status_code,
-                            exc,
-                            text[:2000],
-                        )
-                    return None, resp.status_code
+                return resp.json()
         except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code if exc.response is not None else None
-            text = exc.response.text if exc.response is not None else ""
-            if status == 429 and attempt < settings.gemini_max_retries:
+            if exc.response.status_code == 429 and attempt < settings.gemini_max_retries:
                 retry_after_header = exc.response.headers.get("Retry-After")
                 try:
                     delay = float(retry_after_header) if retry_after_header else None
@@ -118,25 +94,17 @@ def _post_generate_content(body: dict, *, log_warnings: bool = True) -> tuple[di
                 if delay is None:
                     delay = settings.gemini_min_call_interval_seconds * (2**attempt)
                 attempt += 1
-                if log_warnings:
-                    logger.warning(
-                        "Gemini (%s) rate-limited (429) — retrying in %.1fs (attempt %d/%d).",
-                        settings.gemini_model, delay, attempt, settings.gemini_max_retries,
-                    )
+                logger.warning(
+                    "Gemini (%s) rate-limited (429) — retrying in %.1fs (attempt %d/%d).",
+                    settings.gemini_model, delay, attempt, settings.gemini_max_retries,
+                )
                 time.sleep(delay)
                 continue
-            if log_warnings:
-                logger.warning(
-                    "Gemini (%s) call failed with status %s. response body=%r",
-                    settings.gemini_model,
-                    status,
-                    text[:2000],
-                )
-            return None, status
+            logger.warning("Gemini (%s) call failed: %s", settings.gemini_model, exc)
+            return None
         except Exception as exc:  # noqa: BLE001 - any other transport/parse failure must not crash the pipeline
-            if log_warnings:
-                logger.warning("Gemini (%s) call failed: %s", settings.gemini_model, exc)
-            return None, None
+            logger.warning("Gemini (%s) call failed: %s", settings.gemini_model, exc)
+            return None
 
 
 FIELD_EXTRACTION_PROMPT = """You are transcribing a scanned Waqf (Islamic endowment) property registration \
@@ -158,8 +126,7 @@ you are of that specific reading
 If a field is illegible or absent, use null for its value and a low confidence (below 0.3) for it. \
 Preserve the original script (Urdu Nastaliq, Devanagari, or Latin) in name/place fields rather than \
 transliterating. Devanagari text may be Marathi, Hindi, or Sanskrit — transcribe exactly as written \
-without translating between them. Preserve property_id and survey_number exactly as written, including any \
-slashes, dashes, and digit formatting. The Marathi label "सर्वे क्रमांक" corresponds to survey_number."""
+without translating between them."""
 
 
 def _generate_content(raw_bytes: bytes, mime_type: str | None, prompt: str, *, json_response: bool) -> dict | None:
@@ -180,109 +147,7 @@ def _generate_content(raw_bytes: bytes, mime_type: str | None, prompt: str, *, j
             **({"responseMimeType": "application/json"} if json_response else {}),
         },
     }
-    data, _ = _post_generate_content(body)
-    return data
-
-
-def _extract_parsed_json(data: dict) -> dict | None:
-    if not isinstance(data, dict):
-        return None
-
-    if isinstance(data.get("parsed"), dict):
-        return data["parsed"]
-
-    candidates = data.get("candidates")
-    if not isinstance(candidates, list) or not candidates:
-        return None
-
-    first_candidate = candidates[0]
-    if not isinstance(first_candidate, dict):
-        return None
-
-    content = first_candidate.get("content")
-    if isinstance(content, dict):
-        if isinstance(content.get("parsed"), dict):
-            return content["parsed"]
-        parts = content.get("parts")
-        if isinstance(parts, list):
-            for part in parts:
-                if isinstance(part, dict) and isinstance(part.get("parsed"), dict):
-                    return part["parsed"]
-
-    if isinstance(first_candidate.get("parsed"), dict):
-        return first_candidate["parsed"]
-
-    return None
-
-
-def _strip_markdown_code_fence(text: str) -> str:
-    stripped = text.strip()
-    if not stripped.startswith("```"):
-        return stripped
-
-    lines = stripped.splitlines()
-    if not lines:
-        return stripped
-
-    if lines[0].strip().startswith("```"):
-        for idx in range(1, len(lines)):
-            if lines[idx].strip().startswith("```"):
-                return "\n".join(lines[1:idx]).strip()
-        return "\n".join(lines[1:]).strip()
-    return stripped
-
-
-def _extract_first_json_object(text: str) -> dict | None:
-    text = _strip_markdown_code_fence(text)
-    if not text:
-        return None
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    start_index = 0
-    while True:
-        start_index = text.find("{", start_index)
-        if start_index == -1:
-            break
-        candidate = _extract_balanced_json(text, start_index)
-        if candidate is None:
-            start_index += 1
-            continue
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            start_index += 1
-            continue
-    return None
-
-
-def _extract_balanced_json(text: str, start: int) -> str | None:
-    depth = 0
-    in_string = False
-    escape = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if escape:
-            escape = False
-            continue
-        if char == "\\":
-            escape = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
+    return _post_generate_content(body)
 
 
 def _extract_text(data: dict) -> str | None:
@@ -300,7 +165,6 @@ def run_gemini_ocr(raw_bytes: bytes, mime_type: str | None) -> RawTextResult:
     )
     data = _generate_content(raw_bytes, mime_type, prompt, json_response=False)
     if not data:
-        logger.warning("Gemini OCR unavailable; continuing with other available OCR text.")
         return RawTextResult(text="", engine=ExtractionSource.gemini_vision, confidence=0.0,
                               error="Gemini OCR call failed or not configured")
     text = _extract_text(data)
@@ -309,6 +173,94 @@ def run_gemini_ocr(raw_bytes: bytes, mime_type: str | None) -> RawTextResult:
                               error="Unexpected Gemini response shape")
     text = text.strip()
     return RawTextResult(text=text, engine=ExtractionSource.gemini_vision, confidence=0.7 if text else 0.0)
+
+
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_UNESCAPED_QUOTE_RE = re.compile(r'(?<!\\)"')
+
+
+def _repair_truncated_json(text: str) -> str:
+    """Best-effort repair for a response that got cut off mid-generation
+    (finishReason=MAX_TOKENS, or the connection/stream ending early) —
+    e.g. '{"village": "Mauje Bahadurpur"' with no closing brace. This is a
+    genuinely incomplete response, not malformed JSON, so no amount of
+    strict=False or delimiter-fixing helps; the only thing that can save
+    it is closing whatever was left open:
+      1. If the text ends mid-string (an odd number of unescaped quotes),
+         close that string.
+      2. Append enough closing braces to balance every '{' that was
+         opened but never closed.
+    This can't recover a field that was cut off before its closing quote
+    even started, or one truncated mid-key — those simply come back as
+    whatever partial garbage was captured, which is an acceptable
+    trade-off since the alternative is losing every field in the response,
+    including the ones that completed fine before the cutoff."""
+    text = text.rstrip()
+    if _UNESCAPED_QUOTE_RE.findall(text) and len(_UNESCAPED_QUOTE_RE.findall(text)) % 2 == 1:
+        text += '"'
+    # Strip a trailing comma left dangling by a cutoff right after a
+    # completed "key": "value" pair (the common truncation point) — a
+    # trailing comma before the closing brace we're about to add makes
+    # the "repaired" text still invalid JSON otherwise.
+    text = text.rstrip()
+    if text.endswith(","):
+        text = text[:-1]
+    open_braces = text.count("{") - text.count("}")
+    if open_braces > 0:
+        text += "}" * open_braces
+    return text
+
+
+def _parse_translation_json(content: str) -> dict | None:
+    """Parses the translation call's response body, tolerating the ways
+    Gemini's JSON mode still occasionally goes wrong on mixed-script text.
+
+    Tried in order:
+    1. A normal strict parse (the common case).
+    2. strict=False: Python's json module rejects raw control characters
+       (a literal newline, tab, etc.) inside a string value by default,
+       which is exactly the "Expecting ',' delimiter" error this was
+       thrown for — Gemini sometimes emits an unescaped newline inside a
+       transliterated value instead of the required `\\n`. strict=False
+       allows those control characters through instead of failing the
+       whole parse over one stray character.
+    3. Extracting the first {...} block and retrying both of the above,
+       in case the model wrapped the JSON in markdown fences or added
+       stray commentary despite the prompt saying not to.
+    4. Truncation repair: if the response was cut off mid-generation
+       (missing closing brace/quote), try closing it and parsing again —
+       recovers every field that finished before the cutoff instead of
+       losing the whole response over the one that didn't.
+
+    Returns None (with the raw content logged) only if every attempt
+    fails, so the actual malformed text is visible in the logs instead of
+    just the exception message."""
+    candidates = [content]
+    match = _JSON_OBJECT_RE.search(content)
+    if match and match.group(0) != content:
+        candidates.append(match.group(0))
+
+    for text in candidates:
+        for strict in (True, False):
+            try:
+                parsed = json.loads(text, strict=strict)
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                continue
+
+    repaired = _repair_truncated_json(content)
+    if repaired != content:
+        try:
+            parsed = json.loads(repaired, strict=False)
+            if isinstance(parsed, dict):
+                logger.info("Recovered a truncated Gemini translation response via brace/quote repair.")
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    logger.warning("Could not parse Gemini translation response after repair attempts. Raw content: %r",
+                    content[:1000])
+    return None
 
 
 TRANSLATION_PROMPT = """You are helping an English-speaking reviewer read Waqf (Islamic endowment) property \
@@ -320,20 +272,32 @@ For each field value below, give its English rendering:
 aloud in English/Latin letters (e.g. "حاجی محمد رفیق" -> "Haji Muhammad Rafiq"), NOT a meaning-based \
 translation. Use common, natural English spellings for Muslim/South Asian names rather than a rigid \
 letter-by-letter romanization.
-- For property_id and survey_number: convert any Urdu-Indic or Devanagari digits to plain Western (0-9) \
-digits; if the value is already in Western digits/Latin letters, return it unchanged.
-- For registration_date: return it unchanged if already ISO (YYYY-MM-DD) or otherwise render any non-Latin \
-digits as Western digits.
+- For property_id: convert any Urdu-Indic or Devanagari digits to plain Western (0-9) digits; if the value \
+is already in Western digits/Latin letters, return it unchanged.
 - For extent: convert any non-Latin digits to Western digits and transliterate the unit word (e.g. "کنال" \
 -> "kanal", "مرلہ" -> "marla") rather than translating it to a different unit.
 
-Respond with ONLY a JSON object, no prose or markdown fences. Include every field key supplied below, including \
-`village`; do not omit a supplied key. Each value must be the English rendering as a string, or null when it \
-cannot be confidently rendered rather than guessed.
+Respond with ONLY a JSON object, no prose, no markdown fences, whose keys are exactly the field names given \
+below (only include keys for fields provided) and whose values are the English rendering as a string. If a \
+provided value cannot be confidently rendered in English, return null for that key rather than guessing.
 
 FIELDS:
 {fields_json}
 """
+
+# Gemini's translation pass is restricted to these four fields. Excludes
+# survey_number and registration_date deliberately: both are already
+# plain digits/an ISO-ish date in the vast majority of scans (registration
+# numbers and dates are essentially never written with name-like script
+# ambiguity the way mutawalli_name/village are), so a full Gemini vision-
+# quality transliteration call added no real value for them — the local,
+# free, offline `convert_indic_digits` fallback further down in
+# pipeline.py already covers the only thing they actually need (Indic ->
+# Western digit conversion). Keeping them out of every translation call
+# cuts the Gemini call's field count (smaller prompt/response) and, more
+# importantly, means a document with weak survey_number/registration_date
+# readings doesn't need this call to succeed at all.
+TRANSLATABLE_FIELDS = {FieldName.mutawalli_name, FieldName.village, FieldName.property_id, FieldName.extent}
 
 
 def run_gemini_translation(fields: FieldReadings) -> dict[FieldName, str] | None:
@@ -344,7 +308,7 @@ def run_gemini_translation(fields: FieldReadings) -> dict[FieldName, str] | None
     can tell "translation didn't run" apart from "ran and had nothing to
     translate" — same convention as run_gemini_field_extraction above.
     Never raises."""
-    present = {f.value: r.value for f, r in fields.items() if r.value}
+    present = {f.value: r.value for f, r in fields.items() if r.value and f in TRANSLATABLE_FIELDS}
     if not present:
         return None
     if not settings.gemini_configured:
@@ -353,51 +317,52 @@ def run_gemini_translation(fields: FieldReadings) -> dict[FieldName, str] | None
     prompt = TRANSLATION_PROMPT.format(fields_json=json.dumps(present, ensure_ascii=False, indent=2))
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            # Observed in practice: finishReason=MAX_TOKENS with well under
+            # 100 tokens of actual JSON output — gemini-flash-latest
+            # appears to be a reasoning/"thinking" model that spends part
+            # of maxOutputTokens on invisible internal reasoning before
+            # writing the visible answer, and harder scripts (Sanskrit)
+            # seem to push that reasoning longer, leaving less budget for
+            # the real output. thinkingBudget=0 asks it to skip that
+            # reasoning entirely, which this call doesn't need anyway —
+            # it's a small, deterministic transliteration/digit-conversion
+            # task, not something that benefits from step-by-step
+            # reasoning. maxOutputTokens is also raised well past what the
+            # visible JSON alone needs, as a second line of defense in
+            # case thinkingBudget isn't honored by whatever model
+            # "-latest" currently resolves to.
+            "maxOutputTokens": 4096,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
     }
-    logger.info(
-        "Gemini translation request model=%s responseMimeType=%s",
-        settings.gemini_model,
-        body["generationConfig"].get("responseMimeType"),
-    )
-    data, status_code = _post_generate_content(body, log_warnings=False)
+    data = _post_generate_content(body)
     if not data:
-        if status_code == 429:
-            logger.warning(
-                "Gemini translation skipped due to quota exhaustion or rate limit after %d retries; continuing without English transliteration.",
-                settings.gemini_max_retries,
-            )
-        else:
-            logger.warning("Gemini translation call returned no data")
         return None
 
-    logger.info("Gemini translation raw response=%s", data)
-    parsed = _extract_parsed_json(data)
-    if parsed is not None:
-        if not isinstance(parsed, dict):
-            logger.warning("Gemini translation response parsed to non-dict: %s", type(parsed).__name__)
-            return None
-        logger.debug("Gemini translation parsed structured JSON=%s", parsed)
-    else:
-        content = _extract_text(data)
-        if content is None:
-            logger.warning("Unexpected Gemini translation response shape")
-            return None
-        raw_text = content.strip()
-        logger.info("Gemini translation text from _extract_text=%r", raw_text)
-        if raw_text == "":
-            logger.warning("Gemini translation _extract_text returned empty string")
-            return None
-        parsed = _extract_first_json_object(raw_text)
-        if parsed is None:
-            logger.warning(
-                "Could not parse Gemini translation response: raw text did not contain a valid JSON object"
-            )
-            return None
-        logger.info("Gemini translation cleaned JSON=%s", parsed)
+    finish_reason = None
+    try:
+        finish_reason = data["candidates"][0].get("finishReason")
+    except (KeyError, IndexError, TypeError):
+        pass
+    if finish_reason and finish_reason not in ("STOP", "FINISH_REASON_UNSPECIFIED"):
+        logger.warning("Gemini translation call finished with reason=%s (response may be truncated/blocked).",
+                        finish_reason)
+
+    content = _extract_text(data)
+    if content is None:
+        logger.warning("Unexpected Gemini response shape for translation")
+        return None
+    parsed = _parse_translation_json(content)
+    if parsed is None:
+        return None
 
     result: dict[FieldName, str] = {}
     for field in fields:
+        if field not in TRANSLATABLE_FIELDS:
+            continue
         value = parsed.get(field.value)
         if isinstance(value, str) and value.strip():
             result[field] = value.strip()
@@ -430,7 +395,4 @@ def run_gemini_field_extraction(raw_bytes: bytes, mime_type: str | None) -> Fiel
         conf = float(conf) if isinstance(conf, (int, float)) else (0.6 if value else 0.2)
         readings[field] = FieldReading(value=value, confidence=max(0.0, min(1.0, conf)),
                                         source=ExtractionSource.gemini_vision)
-    logger.debug("Gemini field extraction parsed=%s confidences=%s fields=%s",
-                 {field.value: parsed.get(field.value) for field in FieldName}, confidences,
-                 {f.value: r.value for f, r in readings.items()})
     return readings

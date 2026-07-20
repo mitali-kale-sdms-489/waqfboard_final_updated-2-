@@ -51,13 +51,7 @@ ARABIC_RANGES = [(0x0600, 0x06FF), (0xFB50, 0xFDFF), (0xFE70, 0xFEFF)]
 # with common Waqf/legal-deed vocabulary (dāna/grant, sākṣī/witness,
 # tasmāt/therefore, etc.) so it has a realistic chance of matching the kind
 # of short, formal text these scans actually contain.
-MARATHI_MARKERS = [
-    "आहे", "आहेत", "मध्ये", "यांनी", "झाले", "केले", "आणि", "साठी", "चा ", "ची ", "चे ",
-    # Common Marathi wording in property and registration records. These
-    # provide evidence when a short OCR result has no conversational words
-    # such as आहे/आणि, which previously caused a Hindi fallback.
-    "गाव", "तालुका", "जिल्हा", "महाराष्ट्र", "मालमत्ता", "नोंदणी", "क्रमांक", "सर्वे", "खाते", "येथे",
-]
+MARATHI_MARKERS = ["आहे", "आहेत", "मध्ये", "यांनी", "झाले", "केले", "आणि", "साठी", "चा ", "ची ", "चे "]
 HINDI_MARKERS = ["है", "हैं", "में", "और", "किया", "हुआ", "के लिए", "का ", "की ", "के "]
 SANSKRIT_MARKERS = [
     "अस्ति", "तस्य", "तस्याः", "इति", "एव", "स्वयं", "यत्र", "तत्र", "अथ", "स्य ", "स्याः",
@@ -104,7 +98,19 @@ def detect_script_from_filename(filename: str) -> ScriptType | None:
     return None
 
 
-def _classify_devanagari(text: str) -> ScriptType | None:
+# A lexicon "win" only overrides a same-family hint (filename- or
+# early-OCR-derived) if it beats the hint's own score by more than this
+# margin. Real Marathi administrative/registry text (names, survey
+# numbers, boilerplate) routinely scores 0 against MARATHI_MARKERS while a
+# single incidental or loanword hit (e.g. "में"/"और" appearing once) is
+# enough to make Hindi "win" outright under a plain max(). That let one
+# stray match silently overrule a filename that explicitly said
+# "marathi" — this margin means a hint is only overridden by genuinely
+# decisive evidence, not a single stray word.
+DEVANAGARI_OVERRIDE_MARGIN = 2
+
+
+def _classify_devanagari(text: str, hint: ScriptType | None = None) -> ScriptType | None:
     """Scores Devanagari text against Marathi/Hindi/Sanskrit function-word
     lexicons and returns the best match. Returns None on a zero-evidence
     score (e.g. a single name or property ID with no function words) so the
@@ -112,6 +118,14 @@ def _classify_devanagari(text: str) -> ScriptType | None:
     this heuristic silently guessing Hindi — that guess was overriding
     correct filename-based hints for Sanskrit/Marathi scans whenever the OCR
     text was too short to carry any distinguishing marker word.
+
+    `hint` (typically the filename-derived script, or an early OCR pass'
+    guess) is a Devanagari sub-type this text is already believed to be.
+    When the lexicon "winner" only barely edges out the hint's own score
+    (see DEVANAGARI_OVERRIDE_MARGIN) — rather than clearly beating it — the
+    hint is kept instead of flipping on what's likely just an incidental
+    word match. A hint is only overridden when the evidence for a
+    different script is decisively stronger.
 
     Before falling back to "no evidence", this also checks for the
     avagraha (ऽ) and visarga (ः) — see the module-level comments on
@@ -126,7 +140,14 @@ def _classify_devanagari(text: str) -> ScriptType | None:
         ScriptType.sanskrit_devanagari: sum(text.count(m) for m in SANSKRIT_MARKERS),
     }
     best_script, best_score = max(scores.items(), key=lambda kv: kv[1])
+
     if best_score > 0:
+        if (
+            hint in scores
+            and hint != best_script
+            and (best_score - scores[hint]) <= DEVANAGARI_OVERRIDE_MARGIN
+        ):
+            return hint
         return best_script
 
     # No function-word evidence at all — try the weaker, script-level
@@ -141,10 +162,12 @@ def _classify_devanagari(text: str) -> ScriptType | None:
         if visarga_ratio >= 0.15:
             return ScriptType.sanskrit_devanagari
 
-    return None
+    return hint
 
 
-def detect_script(text: str, min_evidence: int = 1) -> ScriptType | None:
+def detect_script(
+    text: str, min_evidence: int = 1, hint: ScriptType | None = None
+) -> ScriptType | None:
     """Returns None when there isn't enough signal (e.g. empty/garbled
     text, or fewer than `min_evidence` matching characters) so the caller
     can fall back to a default instead of trusting a low-evidence guess.
@@ -155,6 +178,15 @@ def detect_script(text: str, min_evidence: int = 1) -> ScriptType | None:
     Previously this only weighed Devanagari vs. Arabic, so a plain-Latin/
     English document (zero of either) fell through to a default that could
     land on Urdu, which is what was mislabeling English scans.
+
+    `hint`, when given a Devanagari sub-type (Marathi/Hindi/Sanskrit) —
+    typically the filename-derived script — is forwarded to
+    `_classify_devanagari` so a marginal/incidental lexicon match doesn't
+    silently overrule it (see DEVANAGARI_OVERRIDE_MARGIN there). This is
+    what fixes filenames like `..._marathi_....pdf` being reported as
+    Hindi: short administrative Marathi text often has zero Marathi
+    function-word matches, and a single incidental Hindi word was enough
+    to win outright before this hint was threaded through.
 
     `min_evidence` defaults to 1 (any signal at all) for callers
     re-detecting from a winning engine's full transcription, where a
@@ -187,7 +219,7 @@ def detect_script(text: str, min_evidence: int = 1) -> ScriptType | None:
     if best_count < min_evidence:
         return None
     if best_key == "devanagari":
-        return _classify_devanagari(text)
+        return _classify_devanagari(text, hint)
     return best_key
 
 

@@ -1,7 +1,8 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
-import logging
 
 from app.config import get_settings
 from app.database import Base, SessionLocal, engine
@@ -14,17 +15,6 @@ from app.services import vector_search
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
-
-# Ensure application-level INFO logs are emitted during development
-# even if the root logger remains at WARNING.
-app_logger = logging.getLogger("app")
-if settings.app_env != "production":
-    app_logger.setLevel(logging.INFO)
-    if not app_logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setLevel(logging.INFO)
-        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
-        app_logger.addHandler(handler)
 
 app = FastAPI(
     title="Waqf Document Verifier API",
@@ -68,6 +58,19 @@ def _migrate_extracted_fields_columns() -> None:
     if "field_value_en" not in existing_columns:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE extracted_fields ADD COLUMN field_value_en TEXT"))
+
+
+def _migrate_waqf_documents_columns() -> None:
+    """Same rationale as _migrate_ocr_settings_columns above — adds
+    reupload_count to any waqf_documents table that pre-dates the
+    flagged-document reupload-attempts feature."""
+    inspector = inspect(engine)
+    if "waqf_documents" not in inspector.get_table_names():
+        return
+    existing_columns = {col["name"] for col in inspector.get_columns("waqf_documents")}
+    if "reupload_count" not in existing_columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE waqf_documents ADD COLUMN reupload_count INTEGER DEFAULT 0"))
 
 
 def _migrate_enum_values(table: str, column: str, required_values: set[str]) -> None:
@@ -122,27 +125,6 @@ def _migrate_enum_values(table: str, column: str, required_values: set[str]) -> 
             conn.execute(text(f"ALTER TYPE {type_name} ADD VALUE IF NOT EXISTS '{value}'"))
 
 
-def _init_pgvector() -> None:
-    """Try to enable the pgvector extension on Postgres. Sets
-    vector_search.pgvector_available so similarity queries can use native
-    operators; on failure the service falls back to Python cosine similarity
-    automatically and the demo keeps working."""
-    if not settings.database_url.startswith("postgres"):
-        vector_search.pgvector_available = False
-        return
-    try:
-        with engine.connect() as conn:
-            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        vector_search.pgvector_available = True
-        logger.info("pgvector extension is available — using native vector search.")
-    except Exception:
-        vector_search.pgvector_available = False
-        logger.warning(
-            "pgvector extension unavailable — vector search will use Python cosine similarity."
-        )
-
-
 def _backfill_validations() -> None:
     """Segment 3 lands validation.run_validations() partway through this
     project's life — any WaqfDocument uploaded before this existed (e.g. the
@@ -172,6 +154,27 @@ def _backfill_validations() -> None:
         db.close()
 
 
+def _init_pgvector() -> None:
+    """Try to enable the pgvector extension on Postgres. Sets
+    vector_search.pgvector_available so similarity queries can use native
+    operators; on failure the service falls back to Python cosine similarity
+    automatically and the app keeps working."""
+    if not settings.database_url.startswith("postgres"):
+        vector_search.pgvector_available = False
+        return
+    try:
+        with engine.connect() as conn:
+            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        vector_search.pgvector_available = True
+        logger.info("pgvector extension is available — using native vector search.")
+    except Exception:
+        vector_search.pgvector_available = False
+        logger.warning(
+            "pgvector extension unavailable — vector search will use Python cosine similarity."
+        )
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     # Segment 1: just users + admin-config tables are seeded. Segments 2-4
@@ -180,6 +183,7 @@ def on_startup() -> None:
     _init_pgvector()
     _migrate_ocr_settings_columns()
     _migrate_extracted_fields_columns()
+    _migrate_waqf_documents_columns()
     _migrate_enum_values("extracted_fields", "source", {"gemini_vision"})
     _migrate_enum_values("ocr_settings", "primary_engine", {"gemini_vision"})
     _migrate_enum_values("waqf_documents", "script_type", {"hindi_devanagari", "sanskrit_devanagari"})

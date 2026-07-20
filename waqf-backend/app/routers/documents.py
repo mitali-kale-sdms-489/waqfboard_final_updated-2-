@@ -20,10 +20,10 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.deps import get_current_user, get_current_user_flexible
 from app.models import (
     DocumentStatus,
@@ -43,13 +43,16 @@ from app.schemas_documents import (
     DocumentDetailOut,
     ReviewOut,
     ReviewSubmitIn,
+    SupportedLanguageOut,
+    TranslateIn,
+    TranslateOut,
     UploadDiagnostics,
     UploadResponse,
     ValidationResultOut,
     WaqfDocumentOut,
 )
 from app.models import ValidationResult
-from app.services import dpdp, storage, validation, vector_search
+from app.services import dpdp, storage, translate_service, validation, vector_search
 from app.services.ocr import pipeline
 
 logger = logging.getLogger(__name__)
@@ -58,6 +61,11 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 ACCEPTED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/tiff", "application/pdf"}
 ACCEPTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".pdf")
 MAX_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB — matches Upload.tsx
+
+# A flagged document gets this many reupload attempts (on top of the
+# original upload) before a reviewer is told to visit the office in person
+# with the original document. Matches Upload.tsx's STARTING_REUPLOAD_ATTEMPTS.
+MAX_REUPLOAD_ATTEMPTS = 3
 
 
 def _is_accepted_file(filename: str, content_type: str | None) -> bool:
@@ -77,8 +85,94 @@ def _to_out(document: WaqfDocument, preview_token: str | None = None) -> WaqfDoc
     return out
 
 
+def _run_ocr_pipeline(document_id: str, raw_bytes: bytes, filename: str, mime_type: str | None) -> None:
+    """Runs the (slow, multi-engine, network-bound) OCR pipeline and
+    persists its results. Called as a FastAPI BackgroundTask *after* the
+    upload response has already been sent, so it needs its own DB session —
+    the request-scoped one from `get_db` is closed by the time this runs.
+
+    This is the piece that used to live inline in `upload_document` before
+    the response was returned. Splitting it out is what makes the upload
+    endpoint itself fast: the client gets an immediate response with
+    status="processing" and polls GET /documents/{id} for the real result,
+    instead of holding one HTTP connection open for however long Sarvam/
+    Tesseract/Gemini/Ollama take (which, per the Ollama-timeout/Gemini-503
+    logs that motivated this change, could comfortably exceed any timeout
+    a client reasonably sets — and did, which is what caused duplicate
+    uploads: the client gave up and the user retried while the original
+    request was still quietly finishing in the background).
+    """
+    db = SessionLocal()
+    try:
+        document = db.get(WaqfDocument, document_id)
+        if document is None:
+            logger.error("Background OCR task couldn't find document %s (deleted before it ran?)", document_id)
+            return
+
+        try:
+            ocr_settings_row = db.get(OcrSettings, 1)
+            fallback_threshold = (
+                ocr_settings_row.ocr_fallback_threshold
+                if ocr_settings_row is not None
+                else pipeline.DEFAULT_OCR_FALLBACK_THRESHOLD
+            )
+            result = pipeline.process_document(raw_bytes, filename, mime_type, fallback_threshold)
+            document.script_type = result.script_type
+            document.overall_confidence = result.overall_confidence
+            document.status = DocumentStatus.extracted
+            document.extraction_notes = "\n".join(result.engine_notes)
+
+            for field_name, reading in result.fields.items():
+                db.add(
+                    ExtractedField(
+                        document_id=document.id,
+                        field_name=field_name,
+                        field_value=reading.value,
+                        field_value_en=reading.value_en,
+                        confidence=reading.confidence,
+                        source=reading.source,
+                    )
+                )
+            db.flush()  # ExtractedField rows must be visible before validation.run_validations queries them
+            validation.run_validations(db, document)
+
+            # Vector search POC — index the document, retrieve Top-K similar
+            # candidates, then use the extracted Property ID as the sole
+            # final verification step. Results are internal diagnostics only
+            # (logged below); the API response contract is unchanged.
+            fields_for_index = db.query(ExtractedField).filter(ExtractedField.document_id == document.id).all()
+            vector_result = vector_search.run_similarity_search_pipeline(db, document.id, fields_for_index)
+            logger.info(
+                "vector_search: document %s indexed=%s candidates=%s property_status=%s matched_document=%s.",
+                document.id,
+                vector_result["indexed"],
+                vector_result["similar_documents"],
+                vector_result["property_match_status"],
+                vector_result["matched_document_id"],
+            )
+
+        except Exception as exc:
+            # A demo should never leave a document stuck on "processing"
+            # forever because of a bad/unusual scan — land it in a flagged
+            # state with zero fields rather than losing the upload.
+            logger.exception("OCR pipeline failed for document %s", document.id)
+            document.status = DocumentStatus.flagged
+            document.overall_confidence = None
+            document.extraction_notes = f"OCR pipeline raised an unhandled error: {exc}"
+            # Still run the rule engine — mandatory_fields_present etc. will
+            # all come back "fail" against zero extracted fields, which is
+            # exactly the useful signal for a reviewer opening this
+            # document manually.
+            validation.run_validations(db, document)
+
+        db.commit()
+    finally:
+        db.close()
+
+
 @router.post("/upload", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
 def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -100,7 +194,7 @@ def upload_document(
         filename=file.filename,
         status=DocumentStatus.processing,
         # script_type is NOT NULL; this is a provisional value, overwritten
-        # below once the OCR pipeline detects the real one.
+        # once the background OCR pass detects the real one.
         script_type=ScriptType.marathi_devanagari,
         # A document counts as synthetic iff its filename matched the same
         # synthetic/sample/demo/template/test naming convention the DPDP
@@ -125,73 +219,89 @@ def upload_document(
     storage_path = storage.save_upload(document.id, file, raw_bytes)
     document.storage_path = storage_path
 
-    try:
-        ocr_settings_row = db.get(OcrSettings, 1)
-        fallback_threshold = (
-            ocr_settings_row.ocr_fallback_threshold
-            if ocr_settings_row is not None
-            else pipeline.DEFAULT_OCR_FALLBACK_THRESHOLD
-        )
-        result = pipeline.process_document(raw_bytes, file.filename, file.content_type, fallback_threshold)
-        document.script_type = result.script_type
-        document.overall_confidence = result.overall_confidence
-        document.status = DocumentStatus.extracted
-        document.extraction_notes = "\n".join(result.engine_notes)
+    # Commit now — the document must actually exist (status="processing")
+    # before we return, so a client that starts polling immediately after
+    # getting this response always finds something. The slow part (OCR)
+    # happens after the response is sent; see _run_ocr_pipeline above.
+    db.commit()
+    db.refresh(document)
 
-        for field_name, reading in result.fields.items():
-            db.add(
-                ExtractedField(
-                    document_id=document.id,
-                    field_name=field_name,
-                    field_value=reading.value,
-                    field_value_en=reading.value_en,
-                    confidence=reading.confidence,
-                    source=reading.source,
-                )
-            )
-        db.flush()  # ExtractedField rows must be visible before validation.run_validations queries them
-        validation.run_validations(db, document)
-        diagnostics = UploadDiagnostics(primary_engine=result.primary_engine, notes=result.engine_notes)
+    background_tasks.add_task(_run_ocr_pipeline, document.id, raw_bytes, file.filename, file.content_type)
 
-        # Vector search POC — index, retrieve Top-5 candidates, then use
-        # extracted Property ID as the sole final verification step. Results
-        # remain internal diagnostics; the upload API contract is unchanged.
-        fields_for_index = db.query(ExtractedField).filter(ExtractedField.document_id == document.id).all()
-        vector_result = vector_search.run_similarity_search_pipeline(db, document.id, fields_for_index)
-        logger.info(
-            "vector_search: document %s indexed=%s candidates=%s property_status=%s matched_document=%s.",
-            document.id,
-            vector_result["indexed"],
-            vector_result["similar_documents"],
-            vector_result["property_match_status"],
-            vector_result["matched_document_id"],
+    return UploadResponse(
+        document=_to_out(document, preview_token=_upload_preview_token(current_user)),
+        fields=[],
+        diagnostics=None,
+    )
+
+
+@router.post("/{document_id}/reupload", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
+def reupload_document(
+    document_id: str,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UploadResponse:
+    """Replaces the file behind a flagged document and re-runs the OCR
+    pipeline against it, capped at MAX_REUPLOAD_ATTEMPTS total attempts
+    (see Dashboard.tsx's "Flagged for review" dialog). Unlike
+    /documents/upload this does not create a new document row — it reuses
+    document_id so the document's review history, id, and any place it's
+    already linked from stay intact; only the file, extraction, and
+    validation state are replaced."""
+    document = db.get(WaqfDocument, document_id)
+    if document is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found.")
+
+    if document.reupload_count >= MAX_REUPLOAD_ATTEMPTS:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{MAX_REUPLOAD_ATTEMPTS} attempts done. Please visit the office.",
         )
 
-    except Exception as exc:
-        # A demo should never 500 on a bad/unusual scan — land the document
-        # in a flagged state with zero fields rather than losing the upload.
-        logger.exception("OCR pipeline failed for document %s", document.id)
-        document.status = DocumentStatus.flagged
-        document.overall_confidence = None
-        document.extraction_notes = f"OCR pipeline raised an unhandled error: {exc}"
-        diagnostics = UploadDiagnostics(
-            primary_engine=ExtractionSource.tesseract,
-            notes=[f"OCR pipeline raised an unhandled error: {exc}"],
+    if not file.filename or not _is_accepted_file(file.filename, file.content_type):
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            "Unsupported file type. Use JPG, PNG, TIFF, WEBP, or PDF.",
         )
-        # Still run the rule engine — mandatory_fields_present etc. will all
-        # come back "fail" against zero extracted fields, which is exactly
-        # the useful signal for a reviewer opening this document manually.
-        validation.run_validations(db, document)
+
+    raw_bytes = file.file.read()
+    if len(raw_bytes) > MAX_SIZE_BYTES:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "File is larger than the 25 MB limit.")
+    if len(raw_bytes) == 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Uploaded file is empty.")
+
+    dpdp_status, dpdp_reason = dpdp.check_dpdp_compliance(file.filename)
+
+    storage_path = storage.save_upload(document.id, file, raw_bytes)
+
+    # Clear out the previous attempt's fields/validations — they belong to
+    # the old file and would otherwise sit alongside (or be confused with)
+    # the new OCR pass's results.
+    db.query(ExtractedField).filter(ExtractedField.document_id == document.id).delete()
+    db.query(ValidationResult).filter(ValidationResult.document_id == document.id).delete()
+
+    document.filename = file.filename
+    document.status = DocumentStatus.processing
+    document.storage_path = storage_path
+    document.mime_type = file.content_type
+    document.file_size_bytes = len(raw_bytes)
+    document.dpdp_status = dpdp_status
+    document.dpdp_reason = dpdp_reason
+    document.overall_confidence = None
+    document.extraction_notes = None
+    document.reupload_count += 1
 
     db.commit()
     db.refresh(document)
 
-    fields = db.query(ExtractedField).filter(ExtractedField.document_id == document.id).all()
+    background_tasks.add_task(_run_ocr_pipeline, document.id, raw_bytes, file.filename, file.content_type)
 
     return UploadResponse(
         document=_to_out(document, preview_token=_upload_preview_token(current_user)),
-        fields=fields,
-        diagnostics=diagnostics,
+        fields=[],
+        diagnostics=None,
     )
 
 
@@ -383,6 +493,31 @@ def get_document_reviews(
         db.query(Review).filter(Review.document_id == document_id).order_by(Review.reviewed_at.asc()).all()
     )
     return reviews
+
+
+@router.get("/translate/languages", response_model=list[SupportedLanguageOut])
+def get_translate_languages(
+    current_user: User = Depends(get_current_user),
+) -> list[SupportedLanguageOut]:
+    """Languages the flag-reason translator (below) can translate into —
+    powers the language dropdown next to a flag reason on the Dashboard."""
+    return [SupportedLanguageOut(**lang) for lang in translate_service.SUPPORTED_LANGUAGES]
+
+
+@router.post("/translate", response_model=TranslateOut)
+def translate_flag_reason(
+    payload: TranslateIn,
+    current_user: User = Depends(get_current_user),
+) -> TranslateOut:
+    """Translates a supervisor's flag/reject reason into the language a
+    reviewer picks from the Dashboard's "Flagged for review" dialog (e.g.
+    Urdu -> English). Source language is auto-detected — see
+    services/translate_service.py."""
+    try:
+        translated = translate_service.translate_text(payload.text, payload.target_language)
+    except translate_service.TranslationError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc))
+    return TranslateOut(translated_text=translated, target_language=payload.target_language)
 
 
 @router.get("/{document_id}/file")

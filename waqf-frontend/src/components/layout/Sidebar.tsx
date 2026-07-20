@@ -19,6 +19,21 @@ export function Sidebar() {
         collapsed ? "w-16" : "w-56"
       )}
     >
+      <div className={cn("flex px-2 pt-3 pb-1", collapsed ? "justify-center" : "justify-end")}>
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          title={collapsed ? "Expand" : "Collapse"}
+          className="flex items-center justify-center rounded-md p-1.5 text-primary-foreground/50 hover:text-primary-foreground/80 hover:bg-primary-foreground/5 transition-colors"
+        >
+          {collapsed ? (
+            <ChevronsRight className="h-4 w-4" strokeWidth={1.75} />
+          ) : (
+            <ChevronsLeft className="h-4 w-4" strokeWidth={1.75} />
+          )}
+        </button>
+      </div>
+
       <nav className="flex-1 px-2 py-4 space-y-1">
         {navItems.map(({ to, label, icon: Icon }) => (
           <NavLink
@@ -40,21 +55,6 @@ export function Sidebar() {
           </NavLink>
         ))}
       </nav>
-
-      <button
-        type="button"
-        onClick={() => setCollapsed((c) => !c)}
-        className="flex items-center gap-2 px-3 py-3 text-xs text-primary-foreground/50 hover:text-primary-foreground/80 border-t border-primary-foreground/10"
-      >
-        {collapsed ? (
-          <ChevronsRight className="h-4 w-4 mx-auto" strokeWidth={1.75} />
-        ) : (
-          <>
-            <ChevronsLeft className="h-4 w-4" strokeWidth={1.75} />
-            Collapse
-          </>
-        )}
-      </button>
     </aside>
   );
 }

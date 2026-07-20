@@ -1,11 +1,13 @@
 """
 Orchestrates a single document through: script detection -> primary OCR
 (Sarvam Vision 3B first; if its own confidence comes back below the
-configured fallback threshold, Tesseract and Gemini Vision are also run and
-whichever scores highest confidence is used — Sarvam remains the preferred
-choice on ties) -> field extraction (Qwen2.5 via a local Ollama server,
-gap-filled by Gemini Vision when available) -> a complete, always-six-field
-result ready to persist.
+configured fallback threshold, Tesseract is also run and compared against
+it — Sarvam remains the preferred choice on ties. Gemini Vision OCR is
+reserved as a genuine last resort, only invoked when Sarvam AND Tesseract
+have BOTH failed outright, since it's an expensive, rate-limited call) ->
+field extraction (Qwen2.5 via a local Ollama server, gap-filled by Gemini
+Vision when available and needed) -> a complete, always-six-field result
+ready to persist.
 
 This replaced an earlier "first engine that returns any non-empty text
 wins" waterfall, and a supervisor-facing "pick the primary engine" admin
@@ -144,15 +146,30 @@ def _run_primary_ocr(
     # the primary transcription. Commonly empty if the urd/mar/eng language
     # packs aren't installed — that's fine, it's only a hint at this stage.
     quick = tesseract_engine.run_tesseract(raw_bytes, mime_type)
+    # Filename hint is computed first and threaded into the quick-pass
+    # detection as its `hint` argument (not just an `or` fallback) so it
+    # gets the same DEVANAGARI_OVERRIDE_MARGIN protection that
+    # _classify_devanagari gives any hint — a filename that already says
+    # "marathi" shouldn't be silently overridden by one incidental Hindi
+    # marker word in Tesseract's noisy, low-quality first pass. Previously
+    # the quick pass was checked with no hint at all, so a single stray
+    # match (garbled OCR routinely produces these) won outright and that
+    # wrong guess then propagated into `_final_script` below as an
+    # already-contaminated hint — which is what was causing genuinely
+    # Marathi scans (correctly named `..._marathi_...`) to come back
+    # labeled Hindi even though the real, clean OCR text unambiguously
+    # scored Marathi higher; the margin was protecting the wrong value.
+    #
     # min_evidence=5: this hint feeds Sarvam Vision's *language* parameter
     # for its read of the whole page, so a noisy low-quality quick pass
     # misreading a handful of stray characters shouldn't be enough to bias
     # Sarvam into reading e.g. a Sanskrit scan as Urdu. Re-detection from
     # the winning engine's own (much higher-quality) output below stays at
     # the default, more lenient threshold.
+    filename_hint = tesseract_engine.detect_script_from_filename(filename)
     early_hint = (
-        tesseract_engine.detect_script(quick.text, min_evidence=5)
-        or tesseract_engine.detect_script_from_filename(filename)
+        tesseract_engine.detect_script(quick.text, min_evidence=5, hint=filename_hint)
+        or filename_hint
     )
     if not early_hint:
         notes.append("No script hint available before OCR (Tesseract produced no text and filename didn't "
@@ -161,11 +178,16 @@ def _run_primary_ocr(
 
     def _final_script(result_text: str) -> ScriptType:
         # Authoritative: re-detect from whichever engine's text actually won,
-        # never just reuse the pre-OCR guess. Falls back to the early hint,
-        # then the filename, then a default — in that order — only if the
-        # winning text itself has no detectable script (e.g. empty/garbled).
+        # never just reuse the pre-OCR guess. `early_hint` is passed through
+        # as a tie-breaking hint (see tesseract_engine._classify_devanagari's
+        # DEVANAGARI_OVERRIDE_MARGIN) so a single incidental Hindi/Sanskrit
+        # word match in genuinely Marathi (or Sanskrit) text doesn't silently
+        # overrule a hint this confident — e.g. a filename that already says
+        # "marathi". Falls back to the early hint, then a default — in that
+        # order — only if the winning text itself has no detectable script
+        # at all (e.g. empty/garbled).
         return (
-            tesseract_engine.detect_script(result_text)
+            tesseract_engine.detect_script(result_text, hint=early_hint)
             or early_hint
             or ScriptType.hindi_devanagari
         )
@@ -189,11 +211,11 @@ def _run_primary_ocr(
     needs_comparison = not candidates or candidates[0].confidence < fallback_threshold
     if needs_comparison:
         if not candidates:
-            notes.append("Sarvam Vision unavailable — comparing Tesseract and Gemini Vision instead.")
+            notes.append("Sarvam Vision unavailable — comparing against Tesseract.")
         else:
             notes.append(
                 f"Sarvam Vision confidence ({sarvam_result.confidence:.2f}) is below the "
-                f"{fallback_threshold:.2f} fallback threshold — comparing against Tesseract and Gemini Vision."
+                f"{fallback_threshold:.2f} fallback threshold — comparing against Tesseract."
             )
 
         if quick.ok:
@@ -202,44 +224,38 @@ def _run_primary_ocr(
         else:
             notes.append(f"Tesseract unavailable ({quick.error}).")
 
+    # Gemini Vision OCR is an expensive, rate-limited call (see
+    # gemini_engine.py's process-wide throttle) — it's reserved as a
+    # genuine last resort now, only invoked when BOTH Sarvam AND Tesseract
+    # have failed outright. Previously this fired any time Sarvam's own
+    # confidence was merely below `fallback_threshold`, even when Tesseract
+    # (or Sarvam itself) had already produced perfectly usable text — that
+    # meant a low-but-real Sarvam confidence alone could trigger a Gemini
+    # call on every such document, which is a large part of why two
+    # documents' worth of OCR could burn through a request-per-minute
+    # quota (see gemini_engine.py's run_gemini_ocr and the rate-limit
+    # investigation that motivated this change). "Failed" here means the
+    # engine actually errored/returned nothing usable (`.ok is False`),
+    # not just "scored low confidence" — a low-confidence-but-successful
+    # Sarvam or Tesseract read no longer triggers this fallback at all.
+    gemini_result: RawTextResult | None = None
+    if not sarvam_result.ok and not quick.ok:
         gemini_result = gemini_engine.run_gemini_ocr(raw_bytes, mime_type)
         if gemini_result.ok:
             candidates.append(gemini_result)
-            notes.append(f"Gemini Vision confidence: {gemini_result.confidence:.2f}.")
+            notes.append(
+                f"Sarvam Vision and Tesseract both failed — used Gemini Vision as a last-resort OCR "
+                f"fallback (confidence: {gemini_result.confidence:.2f})."
+            )
         else:
-            notes.append(f"Gemini Vision unavailable ({gemini_result.error}).")
+            notes.append(f"Gemini Vision (last-resort OCR fallback) also unavailable ({gemini_result.error}).")
+    elif needs_comparison:
+        notes.append("Gemini Vision OCR fallback skipped — Sarvam and/or Tesseract already produced usable "
+                     "text (Gemini OCR is only used when both fail outright).")
 
     if not candidates:
-        # `RawTextResult.ok` is intentionally strict (it also requires no
-        # engine error). For field mapping, however, a partial Tesseract
-        # transcription is still more useful than an empty string when the
-        # cloud OCR fallback is rate-limited. Preserve that available text
-        # so Ollama can attempt extraction instead of being skipped.
-        if quick.text.strip():
-            fallback_result = RawTextResult(
-                text=quick.text,
-                engine=quick.engine,
-                confidence=quick.confidence,
-                error=None,
-            )
-            notes.append(
-                "All preferred OCR candidates failed, but non-empty Tesseract text was retained "
-                "for Ollama field extraction."
-            )
-            final_script = _final_script(fallback_result.text)
-            logger.info(
-                "OCR selected engine=%s text_length=%d fallback_occurred=true.",
-                fallback_result.engine.value,
-                len(fallback_result.text),
-            )
-            return fallback_result, final_script, notes
         notes.append("All OCR engines failed or are unconfigured.")
-        fallback_result = gemini_result if needs_comparison else sarvam_result
-        logger.info(
-            "OCR selected engine=%s text_length=%d fallback_occurred=true.",
-            fallback_result.engine.value,
-            len(fallback_result.text),
-        )
+        fallback_result = gemini_result if gemini_result is not None else sarvam_result
         return fallback_result, (early_hint or ScriptType.hindi_devanagari), notes
 
     # max() returns the first-encountered item on ties, and candidates is
@@ -299,12 +315,6 @@ def _run_primary_ocr(
             notes.append(f"Corrected-language Sarvam Vision re-run failed ({corrected_result.error}) — "
                           "keeping original read.")
 
-    logger.info(
-        "OCR selected engine=%s text_length=%d fallback_occurred=%s.",
-        best.engine.value,
-        len(best.text),
-        needs_comparison,
-    )
     return best, final_script, notes
 
 
@@ -322,31 +332,31 @@ def process_document(
     # longer wired into the pipeline. See qwen_mapper.py for the JSON
     # contract, prompt, and failure handling (Ollama unavailable -> all
     # fields come back empty/0.0 confidence, never raises).
-    logger.info(
-        "Ollama extraction invoking mapper model=%s ocr_text_length=%d.",
-        qwen_mapper.settings.ollama_model,
-        len(primary.text),
-    )
-    logger.debug("Ollama raw OCR text=%s", primary.text)
     fields = qwen_mapper.extract_fields(primary.text, script_type)
-    logger.info(
-        "Ollama extraction completed populated_fields=%d.",
-        sum(1 for reading in fields.values() if reading.value),
-    )
-    logger.debug("Ollama extracted fields=%s", {f.value: r.value for f, r in fields.items()})
 
+    # Gemini field-extraction backfill is conditional again — only called
+    # when Qwen actually left something weak to backfill, not on every
+    # document regardless. (Briefly made unconditional as a cross-check,
+    # but that's an extra guaranteed Gemini call on every document on top
+    # of the OCR fallback, which defeats the point of having just made the
+    # OCR fallback last-resort-only to ease rate-limit pressure.)
     weak_fields = [f for f, r in fields.items() if r.confidence < GAP_FILL_THRESHOLD]
     if weak_fields and settings.gemini_configured:
         gemini_fields = gemini_engine.run_gemini_field_extraction(raw_bytes, mime_type)
         if gemini_fields:
+            backfilled = []
             for field in weak_fields:
                 candidate = gemini_fields.get(field)
                 if candidate and candidate.confidence > fields[field].confidence:
                     fields[field] = candidate
-            notes.append("Gemini Vision used to backfill low-confidence field(s): "
-                         + ", ".join(f.value for f in weak_fields))
+                    backfilled.append(field.value)
+            if backfilled:
+                notes.append("Gemini Vision used to backfill low-confidence field(s): " + ", ".join(backfilled))
+            else:
+                notes.append("Gemini Vision field-extraction backfill ran but found nothing better than the "
+                              "existing reading(s).")
         else:
-            notes.append("Gemini Vision field-extraction backfill attempted but failed or not configured.")
+            notes.append("Gemini Vision field-extraction backfill attempted but failed.")
 
     # Guarantee every FieldName is present even if something upstream
     # skipped it (defensive — extract_fields already covers all six).

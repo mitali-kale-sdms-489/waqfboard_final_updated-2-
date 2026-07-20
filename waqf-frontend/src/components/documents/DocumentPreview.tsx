@@ -2,7 +2,15 @@ import { cn } from "@/lib/utils";
 import type { WaqfDocument } from "@/types/domain";
 import { SCRIPT_TYPE_LABELS } from "@/types/domain";
 
-function ScriptFacsimile({ scriptType }: { scriptType: WaqfDocument["scriptType"] }) {
+function ScriptFacsimile({
+  scriptType,
+  className,
+  minHeightClassName = "min-h-[480px]",
+}: {
+  scriptType: WaqfDocument["scriptType"];
+  className?: string;
+  minHeightClassName?: string;
+}) {
   const isUrdu = scriptType === "urdu_nastaliq";
   const isEnglish = scriptType === "english_latin";
   // Seeded demo records have no real scan behind them — a stylised
@@ -15,7 +23,13 @@ function ScriptFacsimile({ scriptType }: { scriptType: WaqfDocument["scriptType"
     : ["वक्फ नोंदणी दस्तऐवज", "मुतवल्लीचे नाव: _______________", "सर्वे क्रमांक: _______  क्षेत्रफळ: _______", "नोंदणी तारीख: _______________"];
 
   return (
-    <div className="relative flex-1 rounded-lg border border-border bg-[#F6F1E4] p-8 overflow-hidden min-h-[480px]">
+    <div
+      className={cn(
+        "relative flex-1 rounded-lg border border-border bg-[#F6F1E4] p-8 overflow-hidden",
+        minHeightClassName,
+        className
+      )}
+    >
       <div className="absolute inset-3 border border-ink/10 rounded" />
       <div
         className={cn(
@@ -61,7 +75,7 @@ export function DocumentPreview({
         <img
           src={doc.previewUrl}
           alt={`Scan of ${doc.filename}`}
-          className="max-h-[70vh] w-full object-contain"
+          className="h-full max-h-full w-full object-contain"
         />
         <span className="absolute bottom-3 right-4 text-[10px] font-tabular text-ink/50 uppercase tracking-wide bg-white/70 rounded px-1.5 py-0.5">
           Uploaded scan
@@ -97,5 +111,7 @@ export function DocumentPreview({
     );
   }
 
-  return <ScriptFacsimile scriptType={doc.scriptType} />;
+  return (
+    <ScriptFacsimile scriptType={doc.scriptType} className={className} minHeightClassName={minHeightClassName} />
+  );
 }

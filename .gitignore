@@ -19,3 +19,9 @@ waqf-frontend/.env
 *.log
 .vscode/
 .idea/
+waqf-backend/.venv/
+waqf-backend/__pycache__/
+waqf-backend/app/**/__pycache__/
+waqf-backend/*.db
+waqf-frontend/node_modules/
+waqf-frontend/dist/

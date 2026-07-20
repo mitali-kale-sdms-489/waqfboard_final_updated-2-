@@ -68,6 +68,11 @@ class WaqfDocumentOut(CamelModel):
     # app/models.py. Optional/None for pre-existing records saved before
     # this was tracked.
     extraction_notes: str | None = None
+    # How many times this document has been reuploaded after being flagged
+    # (see POST /documents/{id}/reupload). Capped at MAX_REUPLOAD_ATTEMPTS
+    # in app/routers/documents.py — the frontend uses this to show
+    # "N attempts remaining" and disable reupload once exhausted.
+    reupload_count: int = 0
 
 
 class DocumentDetailOut(CamelModel):
@@ -87,9 +92,16 @@ class UploadDiagnostics(CamelModel):
 
 
 class UploadResponse(CamelModel):
+    """Returned immediately once the file is saved and the document row is
+    created with status="processing" — OCR now runs in a background task
+    (see app/routers/documents.py) rather than inline, so at response time
+    there are no fields or diagnostics yet. fields/diagnostics are None
+    while processing; the client polls GET /documents/{id} and gets both
+    once the background OCR pass finishes."""
+
     document: WaqfDocumentOut
-    fields: list[ExtractedFieldOut]
-    diagnostics: UploadDiagnostics
+    fields: list[ExtractedFieldOut] = []
+    diagnostics: UploadDiagnostics | None = None
 
 
 class DashboardStatsOut(CamelModel):
@@ -119,6 +131,25 @@ class ReviewOut(CamelModel):
     notes: str | None
     reviewed_at: datetime
     duration_seconds: int | None
+
+
+class TranslateIn(CamelModel):
+    """POST /documents/translate body - translates a short piece of free
+    text (currently: a supervisor's flag/reject reason) into the language
+    a reviewer picks from the Dashboard's language selector."""
+
+    text: str
+    target_language: str
+
+
+class TranslateOut(CamelModel):
+    translated_text: str
+    target_language: str
+
+
+class SupportedLanguageOut(CamelModel):
+    code: str
+    label: str
 
 
 class OcrSettingsOut(CamelModel):

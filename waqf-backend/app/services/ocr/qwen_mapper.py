@@ -75,8 +75,6 @@ Rules:
 - If a field is missing, return null.
 - Preserve the original language of the values.
 - Do not invent values.
-- Preserve property_id and survey_number exactly as written, including slashes, dashes, and digit formatting.
-- The Marathi label "सर्वे क्रमांक" corresponds to survey_number.
 - CRITICAL for mutawalli_name and village: copy the value EXACTLY, character-for-character, from the OCR \
 text below, in whatever script it's written in (Urdu, Devanagari, etc). Even if you recognize the name and \
 know its English spelling, do NOT romanize, transliterate, or translate it — copy the original characters \
@@ -138,11 +136,6 @@ def _call_ollama(ocr_text: str) -> str | None:
         "format": "json",
         "options": {"temperature": 0},
     }
-    logger.info(
-        "Ollama called model=%s ocr_text_length=%d.",
-        settings.ollama_model,
-        len(ocr_text),
-    )
     try:
         with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
             resp = client.post(url, json=payload)
@@ -167,7 +160,6 @@ def _call_ollama(ocr_text: str) -> str | None:
         logger.error("Ollama response missing/empty 'response' field for model %s: %r",
                       settings.ollama_model, data)
         return None
-    logger.info("Ollama returned response_length=%d for model=%s.", len(response_text), settings.ollama_model)
     return response_text
 
 
@@ -294,24 +286,18 @@ def extract_fields(raw_text: str, script_type: ScriptType | None = None) -> Fiel
     for pipeline.py's post-gap-fill guard to catch as a last resort."""
     text = (raw_text or "").strip()
     if not text:
-        logger.warning("qwen_mapper.extract_fields called with empty OCR text — Ollama called=false.")
+        logger.warning("qwen_mapper.extract_fields called with empty OCR text — skipping Ollama call.")
         return _empty_readings()
 
     response_text = _call_ollama(text)
     if response_text is None:
-        logger.info("Ollama JSON returned=false model=%s (call failed).", settings.ollama_model)
         return _empty_readings()
 
     parsed = _parse_json(response_text)
     if parsed is None:
-        logger.info("Ollama JSON returned=false model=%s.", settings.ollama_model)
         return _empty_readings()
 
-    logger.info("Ollama JSON returned=true model=%s.", settings.ollama_model)
-    logger.debug("Qwen parsed extraction JSON=%s", parsed)
-
     readings = _to_field_readings(parsed)
-    logger.debug("Qwen extraction fields=%s", {f.value: r.value for f, r in readings.items()})
 
     if script_type is not None and script_type != ScriptType.english_latin:
         for field in SCRIPT_SENSITIVE_FIELDS:

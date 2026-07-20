@@ -80,11 +80,22 @@ export function confidenceBand(confidence: number): ConfidenceBand {
 
 /**
  * Result of the automated DPDP data-handling check run against a document
- * right after upload/extraction (per POC-C's blocking rule: no real Waqf
- * board record may proceed past review until DPDP terms exist — this is the
- * system-side check, replacing any user self-declaration at upload time).
+ * right after upload/extraction.
+ *
+ * FUTURE SCOPE: this POC's check is filename-pattern matching only (see
+ * app/services/dpdp.py) — there's no real Waqf-board provenance/consent
+ * system behind it yet, so it isn't a meaningful compliance signal today.
+ * The field is kept here because the backend API still returns it, but the
+ * frontend intentionally does not surface it anywhere (no badges, columns,
+ * or messaging) until a real DPDP data-handling process exists to back it.
  */
 export type DpdpStatus = "checking" | "compliant" | "needs_review";
+
+/** A flagged document gets this many reupload attempts (on top of the
+ *  original upload) before a reviewer is told to visit the office in
+ *  person with the original document. Matches the backend's
+ *  MAX_REUPLOAD_ATTEMPTS in app/routers/documents.py. */
+export const MAX_REUPLOAD_ATTEMPTS = 3;
 
 export interface WaqfDocument {
   id: string;
@@ -92,9 +103,9 @@ export interface WaqfDocument {
   status: DocumentStatus;
   scriptType: ScriptType;
   isSynthetic: boolean;
-  /** Outcome of the automated DPDP compliance check, run once extraction completes. */
+  /** FUTURE SCOPE — see DpdpStatus above. Not currently shown in the UI. */
   dpdpStatus: DpdpStatus;
-  /** Human-readable reason for the dpdpStatus result, shown on hover/expand. */
+  /** FUTURE SCOPE — see DpdpStatus above. Not currently shown in the UI. */
   dpdpReason: string | null;
   uploadedAt: string;
   uploadedBy: string;
@@ -117,6 +128,11 @@ export interface WaqfDocument {
    * this was tracked. See Review.tsx's diagnostics panel.
    */
   extractionNotes?: string | null;
+  /** How many times this document has been reuploaded after being flagged
+   *  (see POST /documents/{id}/reupload). Capped at MAX_REUPLOAD_ATTEMPTS —
+   *  the Dashboard's flag dialog uses this to show "N attempts remaining"
+   *  and disable reupload once exhausted. */
+  reuploadCount: number;
 }
 
 export interface ExtractedField {

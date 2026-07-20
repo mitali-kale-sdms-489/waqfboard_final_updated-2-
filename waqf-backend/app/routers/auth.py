@@ -4,12 +4,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.config import get_settings
 from app.deps import get_current_user
 from app.models import Role, User
 from app.schemas import LoginRequest, RegisterRequest, TokenResponse, UserOut
 from app.security import create_access_token, hash_password, verify_password
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+settings = get_settings()
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
@@ -32,7 +34,11 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> TokenRe
     db.commit()
     db.refresh(user)
 
-    token = create_access_token(subject=str(user.id), extra_claims={"role": user.role.value})
+    token = create_access_token(
+        subject=str(user.id),
+        extra_claims={"role": user.role.value},
+        expires_minutes=settings.user_access_token_expire_minutes if user.role == Role.USER else None,
+    )
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
 
@@ -51,7 +57,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse
     db.commit()
     db.refresh(user)
 
-    token = create_access_token(subject=str(user.id), extra_claims={"role": user.role.value})
+    token = create_access_token(
+        subject=str(user.id),
+        extra_claims={"role": user.role.value},
+        expires_minutes=settings.user_access_token_expire_minutes if user.role == Role.USER else None,
+    )
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
 

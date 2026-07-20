@@ -177,6 +177,14 @@ class WaqfDocument(Base):
         nullable=True,
     )
 
+    # Counts reupload attempts against a flagged document (the original
+    # upload does NOT count against this — it only increments on POST
+    # /documents/{id}/reupload). Capped client- and server-side at
+    # MAX_REUPLOAD_ATTEMPTS (see app/routers/documents.py); once reached,
+    # the document can no longer be reuploaded and the reviewer is told to
+    # visit the office in person with the original document.
+    reupload_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
     fields: Mapped[list["ExtractedField"]] = relationship(
         back_populates="document",
         cascade="all, delete-orphan",
@@ -200,12 +208,13 @@ class WaqfDocument(Base):
 
 
 class DocumentEmbedding(Base):
-    """Semantic search index for a processed document.
+    """Semantic search index for a processed document (vector search POC).
 
     Kept separate from waqf_documents so the existing document schema and
     API serializers stay untouched. One row per document; property_id is
     read from extracted_fields at search/verification time rather than
-    duplicated here."""
+    duplicated here.
+    """
 
     __tablename__ = "document_embeddings"
 
