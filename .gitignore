@@ -25,3 +25,8 @@ waqf-backend/app/**/__pycache__/
 waqf-backend/*.db
 waqf-frontend/node_modules/
 waqf-frontend/dist/
+node_modules/
+Frontend/waqf/node_modules/
+Backend/**/node_modules/
+*.log
+.env
